@@ -16,6 +16,12 @@ struct PageEntry {  // 16 B, local page table
     uint32_t alloc_order;
 };
 
+// PageEntry.flags bits (design table 3.1) and the "no waiter" marker of waiters_head.
+constexpr uint8_t PG_ALLOCATED = 1;
+constexpr uint8_t PG_HOME = 2;  // this node is the page's home
+constexpr uint8_t PG_LOST = 4;  // the home died
+constexpr uint16_t NO_WAITER = 0xFFFF;
+
 struct DirEntry {  // 24 B, directory kept by the home node
     uint16_t owner;
     uint8_t state;
