@@ -337,10 +337,12 @@ void Pager::on_fetch(const std::shared_ptr<Connection>& conn, const Header& h, b
         std::lock_guard<std::mutex> lk(mem_.page_lock(page));
         PageEntry& entry = mem_.entry(page);
         if (entry.state == M) {
-            data.resize(mem_.page_size());
-            mem_.copy_out(page, data.data());
+            // Revoke write access first, copy after: a store that slipped in between the
+            // other order would be lost. The system view still sees the bytes either way.
             page_state_t next = invalidate ? I : S;
             mem_.apply_prot(page, next);
+            data.resize(mem_.page_size());
+            mem_.copy_out(page, data.data());
             entry.state = next;
             version = entry.version;
             have_data = true;

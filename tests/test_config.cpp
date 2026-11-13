@@ -31,7 +31,7 @@ int main() {
 
     // The sample file shipped in the repo must load (it has trailing '#' comments).
     CHECK(config_load("conf/dsm.conf", c, err) == DSM_OK);
-    CHECK(c.max_nodes == 8 && c.port_base == 50000 && c.node_memory == 1048576);
+    CHECK(c.max_nodes == 8 && c.port_base == 28100 && c.node_memory == 1048576);
     CHECK(c.base_address == 0x600000000000ULL && c.pages_per_node() == 256);
 
     // Empty file -> all defaults.

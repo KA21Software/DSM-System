@@ -95,6 +95,12 @@ int Memory::install_page(page_id_t p, const void* data, page_state_t st) {
     return apply_prot(p, st);
 }
 
+int Memory::store_page(page_id_t p, const void* data) {
+    if (!ready() || !valid_page(p) || !data) return DSM_EINVAL;
+    memcpy(sys_addr(p), data, page_size_);
+    return DSM_OK;
+}
+
 int Memory::copy_out(page_id_t p, void* dst) const {
     if (!ready() || !valid_page(p) || !dst) return DSM_EINVAL;
     memcpy(dst, sys_addr(p), page_size_);

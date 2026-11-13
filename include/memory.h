@@ -63,6 +63,9 @@ public:
 
     // Copies one page into the system view, then enables it with one mprotect.
     int install_page(page_id_t p, const void* data, page_state_t st);
+    // Copies one page into the system view only, leaving the user view's permissions alone.
+    // What the home does with a page it got back from an owner.
+    int store_page(page_id_t p, const void* data);
     // Copies one page out of the system view (what the home or owner sends over the network).
     int copy_out(page_id_t p, void* dst) const;
 
