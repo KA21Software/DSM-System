@@ -48,6 +48,10 @@ bool recv_all(int fd, void* data, size_t len) {
 Connection::~Connection() { close_now(); }
 
 void Connection::close_now() {
+    // Shares send_lock with Network::send(): otherwise this could close the fd while another
+    // thread's send() is blocked inside write()/send() on it, and the kernel is then free to
+    // hand that same fd number to a brand new, unrelated socket before the write returns.
+    std::lock_guard<std::mutex> lk(send_lock);
     if (!closed.exchange(true)) close(fd);
 }
 
@@ -61,6 +65,8 @@ void enable_nodelay(int fd) {
 }  // namespace
 
 int Network::listen(uint16_t port) {
+    if (listen_fd_ >= 0) return DSM_EINVAL;  // already bound; stop() first to rebind
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         LOG_ERROR("socket() failed: %s", strerror(errno));
@@ -156,15 +162,19 @@ void Network::set_handler(uint8_t cls, Handler handler) {
 }
 
 int Network::send(const std::shared_ptr<Connection>& conn, Header h, const void* payload, size_t len) {
-    if (!conn || conn->closed.load()) return DSM_ENET;
+    if (!conn) return DSM_ENET;
 
     std::vector<uint8_t> frame;
     int rc = frame_build(h, payload, len, frame);
     if (rc != DSM_OK) return rc;
 
+    // closed is only safe to trust once send_lock is held: close_now() takes the same lock,
+    // so no close() can land between this check and send_all() below.
     std::lock_guard<std::mutex> lk(conn->send_lock);
+    if (conn->closed.load()) return DSM_ENET;
     if (!send_all(conn->fd, frame.data(), frame.size())) {
-        conn->close_now();
+        // Not conn->close_now(): it takes send_lock too, and it is already held here.
+        if (!conn->closed.exchange(true)) close(conn->fd);
         return DSM_ENET;
     }
     return DSM_OK;
@@ -250,7 +260,7 @@ void Network::run() {
 
         // Short timeout: a connection added by connect_to() on another thread only joins
         // this poll() on its next iteration, so the wait cannot be unbounded.
-        int rc = poll(fds.data(), fds.size(), 200);
+        int rc = poll(fds.data(), fds.size(), 50);
         if (rc < 0) {
             if (errno == EINTR) continue;
             LOG_ERROR("poll() failed: %s", strerror(errno));
