@@ -220,6 +220,7 @@ int Membership::join_existing() {
                 my_id_ = join_wait_id_;
                 size_t known = nodes_.size();
                 nlk.unlock();
+                if (names_import_) names_import_(join_wait_names_.data(), join_wait_names_.size(), join_wait_n_names_);
                 LOG_INFO("joined the cluster as node %u (%zu known nodes)", my_id_, known);
                 return DSM_OK;
             }
@@ -260,12 +261,57 @@ void Membership::stop() {
     hb_net_.stop();
 }
 
-bool Membership::is_coordinator() const {
+node_id_t Membership::coordinator_id() const {
     std::shared_lock<std::shared_mutex> lk(nodes_lock_);
-    if (my_id_ == NODE_NONE || my_id_ >= nodes_.size()) return false;
-    for (node_id_t id = 0; id < my_id_; id++)
-        if (nodes_[id].state == ALIVE) return false;  // someone with a lower id outranks us
-    return nodes_[my_id_].state == ALIVE;
+    for (const NodeInfo& n : nodes_)
+        if (n.state != DEAD && n.state != LEFT) return n.node_id;
+    return NODE_NONE;
+}
+
+bool Membership::is_coordinator() const { return my_id_ != NODE_NONE && coordinator_id() == my_id_; }
+
+void Membership::leave() {
+    if (my_id_ == NODE_NONE || !send_fn_) return;
+    Header h;
+    h.type = LEAVE;
+    send_to_others(h, nullptr, 0, NODE_NONE);
+    LOG_INFO("LEAVE sent");
+}
+
+void Membership::send_to_others(Header h, const void* payload, size_t len, node_id_t skip) {
+    if (!send_fn_) return;
+    for (const NodeInfo& n : snapshot()) {
+        if (n.node_id == my_id_ || n.node_id == skip || n.state == DEAD || n.state == LEFT) continue;
+        Header copy = h;
+        copy.seq = 0;
+        send_fn_(n.node_id, copy, payload, len);
+    }
+}
+
+// Marks `id` DEAD here and tells everybody else. Only the coordinator is expected to call it
+// (the others learn from NODE_DEAD), but a duplicate announcement is harmless: mark_down()
+// acts once per node.
+void Membership::announce_dead(node_id_t id) {
+    mark_down(id, DEAD);
+    std::vector<uint8_t> payload;
+    ByteWriter w(payload);
+    w.u16(id);
+    Header h;
+    h.type = NODE_DEAD;
+    send_to_others(h, payload.data(), payload.size(), id);
+}
+
+void Membership::mark_down(node_id_t id, node_state_t how) {
+    {
+        std::unique_lock<std::shared_mutex> lk(nodes_lock_);
+        if (id >= nodes_.size() || id == my_id_) return;
+        NodeInfo& n = nodes_[id];
+        if (n.state == DEAD || n.state == LEFT) return;
+        n.state = how;
+    }
+    if (how == LEFT) LOG_INFO("node %u LEFT the cluster", id);
+    else LOG_ERROR("node %u is DEAD", id);
+    if (down_handler_) down_handler_(id, how == LEFT);
 }
 
 bool Membership::node_info(node_id_t id, NodeInfo& out) const {
@@ -302,13 +348,20 @@ void Membership::on_ctrl_message(const std::shared_ptr<Connection>& conn, const 
         case NODE_ANNOUNCE:
             handle_node_announce(h, payload);
             break;
+        case NODE_DEAD:
+            handle_node_dead(h, payload);
+            break;
+        case LEAVE:
+            handle_leave(h);
+            break;
         default:
             LOG_DEBUG("ignored control message type 0x%02x", h.type);
             break;
     }
 }
 
-void Membership::on_ctrl_error(const std::shared_ptr<Connection>&, const Header& h, const uint8_t*) {
+void Membership::on_ctrl_error(const std::shared_ptr<Connection>&, const Header& h, const uint8_t* payload) {
+    if (reply_hook_ && reply_hook_(h, payload)) return;
     std::lock_guard<std::mutex> lk(join_wait_lock_);
     if (join_wait_pending_ && h.seq == join_wait_seq_) {
         join_wait_status_ = h.status;
@@ -341,8 +394,11 @@ void Membership::handle_join(const std::shared_ptr<Connection>& conn, const Head
         ByteWriter w(ack_payload);
         w.u16(id);
         w.u16(static_cast<uint16_t>(table.size()));
-        w.u16(0);  // n_names: no names table yet (E2 scope)
+        std::vector<uint8_t> names;
+        uint16_t n_names = names_export_ ? names_export_(names) : 0;
+        w.u16(n_names);
         for (const auto& n : table) write_node_info(w, n);
+        w.bytes(names.data(), names.size());
         Header ack;
         ack.type = JOIN_ACK;
         ack.seq = h.seq;
@@ -369,8 +425,15 @@ void Membership::handle_join(const std::shared_ptr<Connection>& conn, const Head
     // A retry can cross with a reply that was just slow, not lost (e.g. request_timeout_ms
     // is tight, or the network briefly stalled): the same (ipv4, slot) means the same
     // physical node asking again, so it gets its existing id back instead of a second one.
+    node_id_t stale_id = NODE_NONE;
     for (const auto& n : nodes_) {
-        if (n.ipv4 != ipv4 || n.slot != slot || n.state == LEFT) continue;
+        if (n.ipv4 != ipv4 || n.slot != slot || n.state == LEFT || n.state == DEAD) continue;
+        if (now_ms() - n.joined_ms > 2ULL * cfg_.request_timeout_ms) {
+            // Too late to be a retry: that process was replaced by a new one in the same slot,
+            // so the old incarnation (and its pages) is gone. It gets a fresh id below.
+            stale_id = n.node_id;
+            continue;
+        }
         node_id_t existing_id = n.node_id;
         if (static_cast<size_t>(existing_id) >= ctrl_conn_.size()) ctrl_conn_.resize(existing_id + 1);
         ctrl_conn_[existing_id] = conn;  // the retry's fresh connection replaces the old one
@@ -386,6 +449,11 @@ void Membership::handle_join(const std::shared_ptr<Connection>& conn, const Head
         LOG_WARN("JOIN from slot %u rejected: cluster full (%u ids used)", slot, cfg_.max_nodes);
         reject(DSM_EFULL);
         return;
+    }
+    if (stale_id != NODE_NONE) {
+        lk.unlock();
+        announce_dead(stale_id);
+        lk.lock();
     }
 
     NodePorts ports = node_ports(cfg_, slot);
@@ -420,12 +488,11 @@ void Membership::handle_join(const std::shared_ptr<Connection>& conn, const Head
     announce.seq = seq_.fetch_add(1);
     announce.src_node = my_id_;
 
-    std::shared_lock<std::shared_mutex> rlk(nodes_lock_);
-    for (node_id_t id = 0; id < static_cast<node_id_t>(ctrl_conn_.size()); id++) {
-        if (id == new_id || !ctrl_conn_[id]) continue;
-        ctrl_net_.send(ctrl_conn_[id], announce, announce_payload.data(), announce_payload.size());
-    }
+    // Through the control plane, not through ctrl_conn_: after a coordinator change this node
+    // has no accepted link to the older members, but it can always dial them.
+    send_to_others(announce, announce_payload.data(), announce_payload.size(), new_id);
 }
+
 
 void Membership::handle_join_ack(const Header& h, const uint8_t* payload) {
     std::lock_guard<std::mutex> lk(join_wait_lock_);
@@ -434,7 +501,7 @@ void Membership::handle_join_ack(const Header& h, const uint8_t* payload) {
     ByteReader r(payload, h.payload_len);
     uint16_t assigned_id = r.u16();
     uint16_t n_nodes = r.u16();
-    r.u16();  // n_names: no names table yet (E2 scope)
+    uint16_t n_names = r.u16();
 
     std::vector<NodeInfo> table;
     table.reserve(n_nodes);
@@ -450,9 +517,27 @@ void Membership::handle_join_ack(const Header& h, const uint8_t* payload) {
         join_wait_status_ = DSM_OK;
         join_wait_id_ = assigned_id;
         join_wait_table_ = std::move(table);
+        join_wait_n_names_ = n_names;
+        join_wait_names_.resize(r.remaining());
+        r.bytes(join_wait_names_.data(), join_wait_names_.size());
     }
     join_wait_pending_ = false;
     join_wait_cv_.notify_all();
+}
+
+void Membership::handle_node_dead(const Header& h, const uint8_t* payload) {
+    ByteReader r(payload, h.payload_len);
+    node_id_t dead = r.u16();
+    if (!r.ok()) return;
+    if (dead == my_id_) {
+        LOG_ERROR("the cluster declared this node DEAD (heartbeats did not reach it)");
+        return;
+    }
+    mark_down(dead, DEAD);
+}
+
+void Membership::handle_leave(const Header& h) {
+    if (h.src_node != NODE_NONE) mark_down(h.src_node, LEFT);
 }
 
 void Membership::handle_node_announce(const Header& h, const uint8_t* payload) {
@@ -482,6 +567,7 @@ void Membership::on_heartbeat(const std::shared_ptr<Connection>& conn, const Hea
     std::unique_lock<std::shared_mutex> lk(nodes_lock_);
     if (h.src_node >= nodes_.size()) return;  // from a node we have not been told about yet
     NodeInfo& n = nodes_[h.src_node];
+    if (n.state == DEAD || n.state == LEFT) return;  // officially gone; it must rejoin as a new node
     bool was_down = n.missed_hb > 0 || n.state != ALIVE;
     // Our own clock, not the sender's timestamp field: the two nodes' clocks are never
     // assumed to be in sync, and last_hb_ms only has to measure elapsed time on this node.
@@ -499,8 +585,7 @@ void Membership::on_heartbeat(const std::shared_ptr<Connection>& conn, const Hea
 
 void Membership::send_heartbeats() {
     std::vector<NodeInfo> table = snapshot();
-    // No allocator yet (E2 scope): the whole range this node owns is still free.
-    uint32_t free_pages = cfg_.pages_per_node();
+    uint32_t free_pages = free_pages_fn_ ? free_pages_fn_() : cfg_.pages_per_node();
 
     std::vector<uint8_t> payload;
     ByteWriter w(payload);
@@ -534,21 +619,34 @@ void Membership::send_heartbeats() {
 
 void Membership::check_missed_heartbeats() {
     uint64_t now = now_ms();
-    std::unique_lock<std::shared_mutex> lk(nodes_lock_);
-    for (auto& n : nodes_) {
-        if (n.node_id == my_id_ || n.state == DEAD || n.state == LEFT) continue;
-        if (now - n.last_hb_ms < cfg_.hb_interval_ms) continue;  // heard from them recently enough
+    std::vector<node_id_t> gone;
+    {
+        std::unique_lock<std::shared_mutex> lk(nodes_lock_);
+        for (auto& n : nodes_) {
+            if (n.node_id == my_id_ || n.state == DEAD || n.state == LEFT) continue;
+            if (now - n.last_hb_ms < cfg_.hb_interval_ms) continue;  // heard from them recently enough
 
-        n.missed_hb++;
-        if (n.missed_hb == cfg_.hb_suspect_after && n.state == ALIVE) {
-            n.state = SUSPECT;
-            LOG_WARN("node %u is now SUSPECT (%u missed heartbeats)", n.node_id, n.missed_hb);
-        } else if (n.missed_hb >= cfg_.hb_dead_after && n.state == SUSPECT) {
-            // Only this node's local view changes here. Officialising DEAD so every node
-            // agrees (NODE_DEAD broadcast by the coordinator, releasing its locks, marking
-            // its home pages LOST) is Fase 2 / E3 work (design section 7.4, PLAN.md).
-            n.state = DEAD;
-            LOG_ERROR("node %u is now DEAD locally (%u missed heartbeats)", n.node_id, n.missed_hb);
+            n.missed_hb++;
+            if (n.missed_hb == cfg_.hb_suspect_after && n.state == ALIVE) {
+                n.state = SUSPECT;
+                LOG_WARN("node %u is now SUSPECT (%u missed heartbeats)", n.node_id, n.missed_hb);
+            } else if (n.missed_hb >= cfg_.hb_dead_after && n.state == SUSPECT) {
+                gone.push_back(n.node_id);
+            }
+        }
+    }
+    // Made official outside the lock: the down handler touches other modules. Every node does
+    // this from its own heartbeats; NODE_DEAD from the coordinator only makes the ones that
+    // have not noticed yet agree (design section 7.3).
+    for (node_id_t id : gone) {
+        mark_down(id, DEAD);
+        if (is_coordinator()) {
+            std::vector<uint8_t> payload;
+            ByteWriter w(payload);
+            w.u16(id);
+            Header h;
+            h.type = NODE_DEAD;
+            send_to_others(h, payload.data(), payload.size(), id);
         }
     }
 }

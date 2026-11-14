@@ -43,6 +43,11 @@ public:
     void set_home_lookup(HomeLookup fn) { home_lookup_ = std::move(fn); }
     void set_request_timeout_ms(uint32_t ms) { request_timeout_ms_ = ms; }
 
+    // A node left or died: every page it was home of becomes LOST here (local copy dropped,
+    // waiters woken with DSM_ENODEDOWN), so a later access ends the application with a clear
+    // message instead of waiting for a timeout (design section 7.4).
+    void on_node_down(node_id_t node);
+
     // Installs the SIGSEGV handler and starts the pager thread. Only one Pager may be active
     // per process: sigaction() is process-wide, so the handler reaches back through a single
     // global pointer (see pager.cpp) rather than a `this`. DSM_EINVAL if one is already
@@ -71,7 +76,8 @@ private:
     void resolve_slot(int slot, int status);
     void unlink_waiter(PageEntry& entry, uint16_t slot);
     void sweep_timeouts();
-    void send_page_request(node_id_t home, page_id_t page, access_t access);
+    bool send_page_request(node_id_t home, page_id_t page, access_t access);
+    void fail_page(page_id_t page, int status);
     void complete_grant(page_id_t page, version_t version, page_state_t granted, const uint8_t* data);
     void on_page_data(const Header& h, const uint8_t* payload);
     void on_upgrade_ack(const Header& h);
@@ -88,6 +94,7 @@ private:
     FaultSlot faults_[kQueueSize];
     std::atomic<uint8_t> dispatched_[kQueueSize]{};  // picked up by the pager thread already?
     uint64_t fault_started_ms_[kQueueSize] = {};      // pager-thread-only, no atomics needed
+    uint64_t fault_started_us_[kQueueSize] = {};      // same, finer: feeds the latency statistics
     sem_t pager_sem_{};
 
     std::mutex conn_lock_;

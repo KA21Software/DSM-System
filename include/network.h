@@ -73,6 +73,10 @@ public:
     int start();
     void stop();
 
+    // Frame bytes (header included) that crossed this instance's sockets, for dsm_stats_t.
+    uint64_t bytes_sent() const { return bytes_sent_.load(); }
+    uint64_t bytes_received() const { return bytes_received_.load(); }
+
 private:
     void run();
     void accept_one();
@@ -82,6 +86,7 @@ private:
     uint16_t bound_port_ = 0;
     std::thread thread_;
     std::atomic<bool> running_{false};
+    std::atomic<uint64_t> bytes_sent_{0}, bytes_received_{0};
 
     std::mutex conns_lock_;
     std::vector<std::shared_ptr<Connection>> conns_;

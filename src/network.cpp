@@ -177,6 +177,7 @@ int Network::send(const std::shared_ptr<Connection>& conn, Header h, const void*
         if (!conn->closed.exchange(true)) close(conn->fd);
         return DSM_ENET;
     }
+    bytes_sent_ += frame.size();
     return DSM_OK;
 }
 
@@ -219,6 +220,7 @@ bool Network::service(const std::shared_ptr<Connection>& conn) {
         if (!recv_all(conn->fd, payload.data(), h.payload_len)) return false;
     }
     const uint8_t* payload_ptr = h.payload_len ? payload.data() : nullptr;
+    bytes_received_ += KADP_HDR_LEN + h.payload_len;
 
     if (payload_verify(h, payload_ptr) != DSM_OK) {
         // The frame itself was well-formed, only the payload was damaged: per section 6.2,

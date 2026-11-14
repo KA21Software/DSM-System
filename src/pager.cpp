@@ -12,6 +12,7 @@
 #include <cstring>
 
 #include "log.h"
+#include "stats.h"
 
 namespace {
 
@@ -28,6 +29,11 @@ void segv_trampoline(int sig, siginfo_t* info, void* ucontext) {
 uint64_t now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+uint64_t now_us() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
 bool is_transitional(uint8_t state) { return state == IS_P || state == IM_P || state == SM_P; }
@@ -148,8 +154,15 @@ void Pager::handle_segv(int sig, siginfo_t* info, void* ucontext) {
     fs.in_use.store(0);
 
     if (result != 0) {
-        const char msg[] = "pager: fault could not be resolved, aborting\n";
-        write(STDERR_FILENO, msg, sizeof msg - 1);
+        // Fixed strings only: nothing but write() is allowed here.
+        const char generic[] = "pager: fault could not be resolved, aborting\n";
+        const char down[] = "pager: DSM_ENODEDOWN: the node that holds this page is gone, aborting\n";
+        const char notalloc[] = "pager: DSM_ENOTALLOC: access to a page that is not allocated, aborting\n";
+        const char timeout[] = "pager: DSM_ETIMEOUT: no answer for this page, aborting\n";
+        if (result == DSM_ENODEDOWN) write(STDERR_FILENO, down, sizeof down - 1);
+        else if (result == DSM_ENOTALLOC) write(STDERR_FILENO, notalloc, sizeof notalloc - 1);
+        else if (result == DSM_ETIMEOUT) write(STDERR_FILENO, timeout, sizeof timeout - 1);
+        else write(STDERR_FILENO, generic, sizeof generic - 1);
         abort();
     }
     // Returning retries the faulting instruction, which now has the right permission.
@@ -173,6 +186,7 @@ void Pager::pager_thread_loop() {
             uint8_t expected = 0;
             if (faults_[i].in_use.load() && dispatched_[i].compare_exchange_strong(expected, 1)) {
                 fault_started_ms_[i] = now_ms();
+                fault_started_us_[i] = now_us();
                 handle_fault(i);
             }
         }
@@ -186,6 +200,7 @@ void Pager::handle_fault(int slot_idx) {
     access_t access = static_cast<access_t>(fs.access);
     node_id_t home = NODE_NONE;
     bool must_send = false;
+    counters().add(access == ACC_WRITE ? counters().faults_write : counters().faults_read);
 
     {
         std::lock_guard<std::mutex> lk(mem_.page_lock(page));
@@ -193,6 +208,10 @@ void Pager::handle_fault(int slot_idx) {
 
         if (access_satisfied(entry.state, access)) {
             resolve_slot(slot_idx, DSM_OK);
+            return;
+        }
+        if (entry.flags & PG_LOST) {  // its home died: there is nobody to ask
+            resolve_slot(slot_idx, DSM_ENODEDOWN);
             return;
         }
 
@@ -212,10 +231,48 @@ void Pager::handle_fault(int slot_idx) {
     // timeout), and nothing about that wait should hold up unrelated pages in the same
     // lock stripe (design's "no network waits while holding a lock" applies to replies, but
     // minimising hold time is good practice regardless).
-    if (must_send) send_page_request(home, page, access);
+    if (must_send && !send_page_request(home, page, access)) fail_page(page, DSM_ENODEDOWN);
+}
+
+// The request never left this node (no route to the home): wake everyone waiting on the page.
+void Pager::fail_page(page_id_t page, int status) {
+    std::lock_guard<std::mutex> lk(mem_.page_lock(page));
+    PageEntry& entry = mem_.entry(page);
+    if (!is_transitional(entry.state)) return;
+    entry.state = I;
+    uint16_t w = entry.waiters_head;
+    entry.waiters_head = NO_WAITER;
+    while (w != NO_WAITER) {
+        uint16_t next = faults_[w].next_waiter;
+        resolve_slot(w, status);
+        w = next;
+    }
+}
+
+void Pager::on_node_down(node_id_t node) {
+    page_id_t first = mem_.first_page_of(node);
+    for (page_id_t p = first; p < first + mem_.pages_per_node() && p < mem_.total_pages(); p++) {
+        std::lock_guard<std::mutex> lk(mem_.page_lock(p));
+        PageEntry& entry = mem_.entry(p);
+        entry.flags |= PG_LOST;
+        if (entry.state == S || entry.state == M) {
+            mem_.apply_prot(p, I);
+            entry.state = I;
+        } else if (is_transitional(entry.state)) {
+            entry.state = I;
+            uint16_t w = entry.waiters_head;
+            entry.waiters_head = NO_WAITER;
+            while (w != NO_WAITER) {
+                uint16_t next = faults_[w].next_waiter;
+                resolve_slot(w, DSM_ENODEDOWN);
+                w = next;
+            }
+        }
+    }
 }
 
 void Pager::resolve_slot(int slot, int status) {
+    if (status == DSM_OK && fault_started_us_[slot]) counters().note_fault_latency(now_us() - fault_started_us_[slot]);
     faults_[slot].result = static_cast<int16_t>(status);
     sem_post(&faults_[slot].done);
 }
@@ -266,16 +323,16 @@ std::shared_ptr<Connection> Pager::data_connection(node_id_t home) {
     return conn;
 }
 
-void Pager::send_page_request(node_id_t home, page_id_t page, access_t access) {
+bool Pager::send_page_request(node_id_t home, page_id_t page, access_t access) {
     auto conn = data_connection(home);
-    if (!conn) return;  // no route to the home right now; sweep_timeouts() will give up on it
+    if (!conn) return false;  // no route to the home: it is down or unreachable
 
     Header h;
     h.type = PAGE_REQUEST;
     h.page_id = page;
     h.flags = (access == ACC_WRITE) ? F_ACCESS_WRITE : 0;
     h.src_node = my_node_id_;
-    data_net_.send(conn, h, nullptr, 0);
+    return data_net_.send(conn, h, nullptr, 0) == DSM_OK;
 }
 
 void Pager::complete_grant(page_id_t page, version_t version, page_state_t granted, const uint8_t* data) {
@@ -298,6 +355,7 @@ void Pager::complete_grant(page_id_t page, version_t version, page_state_t grant
 }
 
 void Pager::on_page_data(const Header& h, const uint8_t* payload) {
+    counters().add(counters().pages_received);
     page_state_t granted = (h.flags & F_GRANT_M) ? M : S;
     complete_grant(h.page_id, h.page_version, granted, payload);
 }
@@ -306,6 +364,7 @@ void Pager::on_upgrade_ack(const Header& h) { complete_grant(h.page_id, h.page_v
 
 void Pager::on_invalidate(const std::shared_ptr<Connection>& conn, const Header& h) {
     page_id_t page = h.page_id;
+    counters().add(counters().invalidations_received);
     {
         std::lock_guard<std::mutex> lk(mem_.page_lock(page));
         PageEntry& entry = mem_.entry(page);
