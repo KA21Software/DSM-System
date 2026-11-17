@@ -6,12 +6,11 @@
 // N, K, M, the row partition among workers and the triple loop of matricesMultiplication().
 // What changes:
 //   - a "thread" is now a node: worker id = DSM node id, numOfThreads = number of nodes;
-//   - A, B and C live in the shared address space instead of malloc'ed memory, one after the
-//     other (page aligned), so their pages are spread over the homes of every node;
+//   - A, B and C are named allocations of the DSM (dsm_alloc_named) instead of malloc'ed
+//     memory, so every node sees the same pages and they spread over the homes of every node;
 //   - drand48() is replaced by a hash of (matrix, row, column): every node can then fill its
 //     own slice, and any entry can be recomputed independently to verify the result;
-//   - there are no locks or barriers in the DSM yet (E3), so phases are separated by a small
-//     barrier built on flags in shared memory (one flag per node, one page each).
+//   - phases are separated with dsm_barrier, run by the coordinator of the cluster.
 //
 // Usage: mm_dsm <dsm.conf> <N> <K> <M> <print 0|1> <nodes>   (A is NxK, B is KxM, C is NxM)
 // Start it once per node, node 0 first.
@@ -27,8 +26,6 @@
 
 namespace {
 
-constexpr size_t kPage = 4096;
-
 double *A, *B, *C;
 long N, K, M, numOfNodes;
 int me;
@@ -43,17 +40,12 @@ double element(int matrix, long i, long j) {
     return 3.0 * static_cast<double>(x >> 11) / 9007199254740992.0;
 }
 
-size_t align_up(size_t n) { return (n + kPage - 1) / kPage * kPage; }
-
-// Barrier on shared memory: node i writes phase to its own flag page, then waits for the
-// others to reach the same phase.
-volatile uint32_t* flag(int node) {
-    return reinterpret_cast<volatile uint32_t*>(static_cast<char*>(dsm_home_base(0)) + static_cast<size_t>(node) * kPage);
-}
 void barrier(uint32_t phase) {
-    *flag(me) = phase;
-    for (int n = 0; n < numOfNodes; n++)
-        while (*flag(n) < phase) usleep(500);
+    int rc = dsm_barrier(phase, static_cast<uint16_t>(numOfNodes));
+    if (rc != 0) {
+        fprintf(stderr, "[node %d] barrier %u failed: %s\n", me, phase, dsm_strerror(rc));
+        exit(3);
+    }
 }
 
 // Same partition as the original: the first (numOfThreads - remainder) workers get one row
@@ -121,23 +113,19 @@ int main(int argc, char** argv) {
     me = dsm_node_id();
     if (me >= numOfNodes) { fprintf(stderr, "node id %d is outside the %ld nodes of this run\n", me, numOfNodes); dsm_shutdown(); return 2; }
 
-    // Layout of the shared space: one flag page per possible node, then A, B and C.
-    size_t flags_bytes = static_cast<size_t>(dsm_space_size() / dsm_home_size()) * kPage;
-    size_t a_bytes = align_up(N * K * sizeof(double)), b_bytes = align_up(K * M * sizeof(double)),
-           c_bytes = align_up(N * M * sizeof(double));
-    if (flags_bytes + a_bytes + b_bytes + c_bytes > dsm_space_size()) {
-        fprintf(stderr, "matrices need %zu bytes but the shared space has %zu: raise node_memory in dsm.conf\n",
-                flags_bytes + a_bytes + b_bytes + c_bytes, dsm_space_size());
+    printf("[node %d] up, waiting for %ld nodes...\n", me, numOfNodes);
+    while (dsm_num_nodes() < numOfNodes) usleep(100000);
+
+    // Every node asks for the same names; the first one creates them, the rest get the same pages.
+    A = static_cast<double*>(dsm_alloc_named("A", N * K * sizeof(double)));
+    B = static_cast<double*>(dsm_alloc_named("B", K * M * sizeof(double)));
+    C = static_cast<double*>(dsm_alloc_named("C", N * M * sizeof(double)));  // zero-filled, like calloc
+    if (!A || !B || !C) {
+        fprintf(stderr, "[node %d] cannot allocate the matrices: %s (raise node_memory or max_nodes in dsm.conf)\n", me,
+                dsm_strerror(dsm_last_error()));
         dsm_shutdown();
         return 2;
     }
-    char* base = static_cast<char*>(dsm_home_base(0));
-    A = reinterpret_cast<double*>(base + flags_bytes);
-    B = reinterpret_cast<double*>(base + flags_bytes + a_bytes);
-    C = reinterpret_cast<double*>(base + flags_bytes + a_bytes + b_bytes);  // untouched memory is zero, like calloc
-
-    printf("[node %d] up, waiting for %ld nodes...\n", me, numOfNodes);
-    while (dsm_num_nodes() < numOfNodes) usleep(100000);
 
     // Each node fills its own rows of A and of B (same partition as the work).
     long s, e;
@@ -167,8 +155,7 @@ int main(int argc, char** argv) {
                 printf("\n");
             }
     }
-    barrier(3);          // nobody leaves while node 0 still reads pages that live on other nodes
-    usleep(500000);
+    barrier(3);  // nobody leaves while node 0 still reads pages that live on other nodes
     printf("[node %d] %s\n", me, ok ? "RESULT: OK" : "RESULT: FAIL");
     dsm_shutdown();
     return ok ? 0 : 1;

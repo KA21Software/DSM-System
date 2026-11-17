@@ -18,7 +18,7 @@ ifneq ($(OBJS),)
 LIB_DEP := $(LIB)
 endif
 
-.PHONY: all test clean demo
+.PHONY: all test itest clean demo
 all: $(LIB_DEP) $(TESTS) $(APPS)
 
 $(LIB): $(OBJS)
@@ -38,6 +38,13 @@ $(BUILD)/apps/%: apps/%.cpp $(LIB_DEP)
 
 test: $(TESTS)
 	@for t in $(TESTS); do echo "== $$t"; $$t || exit 1; done
+
+# Integration tests: several processes of this PC acting as nodes (a few minutes).
+itest: all
+	tests/test_cluster.sh 3
+	tests/test_cluster.sh 4
+	tests/test_apps.sh 3 256 6
+	tests/test_failure.sh
 
 clean:
 	rm -rf $(BUILD)
