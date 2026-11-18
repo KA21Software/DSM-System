@@ -1,0 +1,64 @@
+# Simula 3 PC del laboratorio como 3 contenedores con IP propia en la misma red.
+# Cada contenedor tiene su propio sistema de archivos (copia de la imagen), asi que compilar
+# en uno no afecta a los demas, igual que compilar en 3 PC distintas.
+#
+# Uso:
+#   cd docker
+#   docker compose build          # construye la imagen una vez (usa el Dockerfile)
+#   docker compose up -d          # levanta los 3 contenedores en segundo plano
+#   docker exec -it dsm_pc1 bash  # abre una "terminal" en la PC1 (igual con dsm_pc2, dsm_pc3)
+#   docker compose down           # apaga y borra los 3 contenedores al terminar
+
+services:
+  pc1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: dsm-lab:ubuntu20.04
+    container_name: dsm_pc1
+    hostname: pc1
+    tty: true
+    stdin_open: true
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.11
+    ports:
+      - "28103:28103" # vista web del nodo del slot 0 de esta "PC"
+    command: ["sleep", "infinity"]
+
+  pc2:
+    image: dsm-lab:ubuntu20.04
+    container_name: dsm_pc2
+    hostname: pc2
+    tty: true
+    stdin_open: true
+    depends_on:
+      - pc1
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.12
+    ports:
+      - "28113:28103"
+    command: ["sleep", "infinity"]
+
+  pc3:
+    image: dsm-lab:ubuntu20.04
+    container_name: dsm_pc3
+    hostname: pc3
+    tty: true
+    stdin_open: true
+    depends_on:
+      - pc1
+    networks:
+      labnet:
+        ipv4_address: 172.28.0.13
+    ports:
+      - "28123:28103"
+    command: ["sleep", "infinity"]
+
+networks:
+  labnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
