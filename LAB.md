@@ -378,10 +378,23 @@ Para estresar un poco más, repetir con un tamaño mayor (por ejemplo `1000 1000
 `node_memory × 3` sea suficiente para A+B+C (1000×1000×8×3 ≈ 24 MB: con 16 MB por nodo, 48 MB
 totales, también cabe).
 
-### 8.5 Segunda aplicación
+### 8.5 Segunda aplicación (`relax_dsm`: técnica de relajación)
 
-*(Pendiente: se agrega a esta guía cuando el equipo elija la segunda app de GitHub, según
-`CAMBIOS_E3.md` §5. Usar el mismo patrón: nodo 0 primero, un proceso por PC, mismo `lab.conf`.)*
+En PC1:
+```bash
+build/apps/relax_dsm conf/lab.conf 256 0.5 3000 0 3
+```
+(`256` = dimensión del tablero 256×256; `0.5` = precisión; `3000` = máximo de iteraciones; `0` = no
+imprimir el tablero; `3` = cantidad de nodos.) Esperar ~2 s, y en PC2 y PC3 exactamente el mismo comando.
+
+**Qué esperar:** cada nodo imprime cuántas iteraciones hizo y si convergió (`converged`) o llegó
+al límite (`iteration limit`); el **nodo 0** imprime `verification against a sequential run ...: OK`
+(repite las mismas iteraciones en un arreglo local y compara todas las celdas; deben ser idénticas)
+y todos terminan con `RESULT: OK`. Cualquier otra cosa es un error de coherencia: guardar salida y logs.
+
+Memoria: dos tableros de dim×dim doubles (256 → 0.5 MB cada uno) más una página por nodo y paridad.
+Esta app hace una barrera por iteración, así que es la mejor para ver tráfico de coherencia entre
+vecinos (`stats global` en la consola: invalidaciones y páginas enviadas suben en cada iteración).
 
 ### 8.6 Caída de un nodo (membresía y recuperación del lock)
 

@@ -11,7 +11,7 @@ Diseño completo: [docs/](docs/).
 |------------|--------------------------------------------------------|
 | `include/` | Cabeceras públicas (`dsm.h`) e internas (`kadp_*.h`)   |
 | `src/`     | Implementación de `libdsm` (un `.cpp` por módulo)      |
-| `apps/`    | Aplicaciones: `mm_dsm` (matrices), `selftest_dsm`, `idle_dsm` |
+| `apps/`    | Aplicaciones: `mm_dsm` (matrices), `relax_dsm` (relajación), `selftest_dsm`, `idle_dsm` |
 | `tests/`   | Pruebas unitarias (`make test`) y de integración (`make itest`) |
 | `conf/`    | `dsm.conf` de ejemplo                                  |
 | `docs/`    | Documentos de diseño y entregables                     |
@@ -30,6 +30,7 @@ Todas se lanzan una vez por nodo, **el nodo 0 primero**; `<nodos>` es la cantida
 
 ```
 build/apps/mm_dsm conf/dsm.conf <N> <K> <M> 0 <nodos>            # C = A x B, verifica 200 entradas
+build/apps/relax_dsm conf/dsm.conf <dim> <precision> <max_iter> 0 <nodos>  # relajación, verifica contra corrida secuencial
 build/apps/selftest_dsm conf/dsm.conf <nodos>                     # escenarios de concurrencia, locks, nombres, free
 build/apps/idle_dsm conf/dsm.conf <segundos> [plain|holder|waiter|alloc]
 ```

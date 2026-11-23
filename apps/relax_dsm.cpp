@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 
 #include "dsm.h"
@@ -85,7 +86,6 @@ int main(int argc, char** argv) {
     maxIter = strtol(argv[4], &end, 10);
     if (*end || maxIter < 1) { printf("Invalid number of iterations.\n"); return 1; }
     long printResults = strtol(argv[5], &end, 10);
-    (void)printResults;  // used when the result is printed
     if (*end) { printf("Invalid print flag.\n"); return 1; }
     numOfNodes = strtol(argv[6], &end, 10);
     if (*end || numOfNodes < 1) { printf("Invalid number of nodes.\n"); return 1; }
@@ -121,7 +121,69 @@ int main(int argc, char** argv) {
     partition(dim - 2, me, numOfNodes, is, ie);  // interior rows 1..dim-2
     printf("[node %d] interior rows %ld..%ld of %ld, grid %ldx%ld ready\n", me, is + 1, ie, dim - 2, dim, dim);
 
-    barrier(2);
+    // Jacobi sweeps. Reads go to `cur`, writes to `nxt`; one barrier per sweep means nobody
+    // starts the next sweep (which overwrites the old `cur`) while a neighbour still reads it.
+    // Each node publishes its largest update in its own page of `diffs`, on a parity that
+    // alternates, so reading everybody's value never races with the next sweep's write.
+    double *cur = gridA, *nxt = gridB;
+    const size_t per_page = kPage / sizeof(double);
+    struct timeval t0, t1;
+    gettimeofday(&t0, nullptr);
+    long iter = 0;
+    bool converged = false;
+    while (iter < maxIter && !converged) {
+        double local = 0;
+        for (long i = is + 1; i <= ie; i++)
+            for (long j = 1; j < dim - 1; j++) {
+                double v = (cur[i * dim + j - 1] + cur[i * dim + j + 1] + cur[(i - 1) * dim + j] + cur[(i + 1) * dim + j]) / 4.0;
+                double d = std::fabs(v - cur[i * dim + j]);
+                if (d > local) local = d;
+                nxt[i * dim + j] = v;
+            }
+        double* mine = diffs + (static_cast<size_t>(iter & 1) * numOfNodes + me) * per_page;
+        *mine = local;
+        barrier(10 + static_cast<uint32_t>(iter & 1));
+
+        double global = 0;
+        for (long n = 0; n < numOfNodes; n++) {
+            double v = diffs[(static_cast<size_t>(iter & 1) * numOfNodes + n) * per_page];
+            if (v > global) global = v;
+        }
+        converged = global < precision;
+        std::swap(cur, nxt);
+        iter++;
+    }
+    gettimeofday(&t1, nullptr);
+    double elapsed = static_cast<double>(t1.tv_sec - t0.tv_sec) + static_cast<double>(t1.tv_usec - t0.tv_usec) / 1e6;
+    printf("[node %d] %ld iterations (%s), time %f sec\n", me, iter, converged ? "converged" : "iteration limit", elapsed);
+
+    // Node 0 repeats the same sweeps on one private array and compares every cell: the sweep
+    // is deterministic (same operations in the same order), so the results must be identical.
+    int ok = 1;
+    if (me == 0) {
+        std::vector<double> a(dim * dim), b(dim * dim);
+        for (long i = 0; i < dim; i++)
+            for (long j = 0; j < dim; j++) a[i * dim + j] = b[i * dim + j] = element(i, j);
+        for (long it = 0; it < iter; it++) {
+            for (long i = 1; i < dim - 1; i++)
+                for (long j = 1; j < dim - 1; j++)
+                    b[i * dim + j] = (a[i * dim + j - 1] + a[i * dim + j + 1] + a[(i - 1) * dim + j] + a[(i + 1) * dim + j]) / 4.0;
+            a.swap(b);
+        }
+        long bad = 0;
+        for (long i = 0; i < dim * dim; i++)
+            if (a[i] != cur[i]) bad++;
+        ok = bad == 0;
+        printf("[node 0] verification against a sequential run (%ld cells): %s\n", dim * dim, ok ? "OK" : "FAIL");
+        if (!ok) printf("[node 0] %ld cells differ\n", bad);
+        if (printResults != 0)
+            for (long i = 0; i < dim; i++) {
+                for (long j = 0; j < dim; j++) printf("%9.4f", cur[i * dim + j]);
+                printf("\n");
+            }
+    }
+    barrier(3);  // nobody leaves while node 0 still reads pages that live on other nodes
+    printf("[node %d] %s\n", me, ok ? "RESULT: OK" : "RESULT: FAIL");
     dsm_shutdown();
-    return 0;
+    return ok ? 0 : 1;
 }
